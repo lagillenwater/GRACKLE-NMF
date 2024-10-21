@@ -1,0 +1,328 @@
+---
+title: "HTP_conditional_factorization"
+author: "Lucas Gillenwater"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+```{r}
+library(tidyverse)
+```
+
+
+# Data
+```{r}
+## counts pre=processing, only run once.
+
+# counts <- read.delim("~/OneDrive - The University of Colorado Denver/Projects/ImmunoMetabolicSubtypes/data/HTP_data/HTP_WholeBlood_RNAseq_Counts_Synapse.txt")
+# 
+# load("~/OneDrive - The University of Colorado Denver/Projects/ImmunoMetabolicSubtypes/data/processed/processed_transcriptome.RData")
+# 
+# htp_expr <- counts %>%
+#     filter(Gene_name %in% names(expression_list$expression)) %>%
+#     dplyr::select(LabID, Gene_name,Value) %>%
+#     distinct(LabID, Gene_name, .keep_all = T) %>%
+#     pivot_wider(names_from = Gene_name, id_cols = LabID, values_from = Value) %>%
+#     column_to_rownames("LabID")
+# 
+# save(htp_expr, file = "~/OneDrive - The University of Colorado Denver/Projects/causalNMF/data/htp_expression_counts_prot_variance_filtered.RData")
+
+```
+
+```{r}
+source("~/OneDrive - The University of Colorado Denver/Projects/causalNMF/R/multinomNMF.R")
+
+load( "~/OneDrive - The University of Colorado Denver/Projects/causalNMF/data/htp_expression_counts_prot_variance_filtered.RData")
+
+comorbid_long <- read.delim("~/OneDrive - The University of Colorado Denver/Projects/ImmunoMetabolicSubtypes/data/HTP_data/P4C_Comorbidity_020921.tsv", skip = 1)
+
+comorbid_wide <- comorbid_long %>%
+#  mutate(HasCondition = as.factor(HasCondition)) %>%
+  pivot_wider(names_from = Condition, values_from = HasCondition, id_cols = RecordID)
+
+metadata <- read.delim("~/OneDrive - The University of Colorado Denver/Projects/ImmunoMetabolicSubtypes/data/HTP_data/P4C_metadata_021921_Costello.txt")
+
+metadata <- metadata %>%
+  left_join(comorbid_wide, by = "RecordID")
+
+dim(metadata)
+
+metadata <- metadata %>%
+  mutate(karyotype_binary =ifelse(Karyotype == "T21",1,0))
+
+# metadata <- metadata %>%
+#   mutate(
+#     across(unique(comorbid_long$Condition), ~replace_na(.x,as.factor(0))))
+
+metadata <- metadata %>%
+  tibble(.name_repair = "universal")
+
+# create metavariable for features with counts > 
+
+summary(metadata)
+
+metadata <- metadata %>%
+  mutate(condition = interaction(metadata$Any.autoimmune.skin.condition,
+                                 metadata$Any.hypothyroidism))
+
+
+metadata <- metadata %>%
+  filter(LabID %in% rownames(htp_expr)) 
+
+htp_expr <- htp_expr %>%
+  filter(rownames(htp_expr) %in% metadata$LabID)
+
+htp_expr <- apply(htp_expr,2,min_max_scale)
+
+metadata <- metadata[match(rownames(htp_expr),metadata$LabID),]
+
+identical(rownames(htp_expr), metadata$LabID)
+```
+
+
+# How many LV's?
+
+1. The 'elbow' method. As pointed out in PLIER paper, the number of constrained LV's needed to explain the data may be higher, so increase initial k by a factor of 2. 
+2. sum up the variance and set threshold (95%)
+
+```{r}
+source("~/OneDrive - The University of Colorado Denver/Projects/causalNMF/R/eigengap.R")
+
+# Perform PCA
+pca_result <- prcomp(htp_expr,
+             center = TRUE,
+             scale = TRUE)
+
+# Calculate the proportion of variance explained by each principal component
+explained_variance <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+
+# Calculate the cumulative proportion of variance explained
+cumulative_variance <- cumsum(explained_variance)
+
+# cumulative variace > 90%
+min(which(cumulative_variance >.9))
+
+# Plot the explained variance
+plot(explained_variance[1:20], type = "b", xlab = "Principal Component", ylab = "Proportion of Variance Explained",
+     main = "Scree Plot")
+```
+
+```{r}
+source("~/OneDrive - The University of Colorado Denver/Projects/causalNMF/R/multinomNMF.R")
+
+A = htp_expr[,1:1000]
+exposure = "karyotype_binary"
+condition = "Obesity"
+metadata = metadata
+iterations = 50
+lv_num = 20
+learning_rate = .001
+alpha = .5
+
+
+res<- multinomNNMF(A = A,
+                   exposure = exposure,
+             condition = condition,
+             metadata = metadata,
+             iterations = iterations,
+             lv_num = lv_num,
+             learning_rate = learning_rate,
+             alpha = alpha
+             )
+res$greatest_mediators
+```
+
+# plot predicted vs the observed table with and without mediator effect
+
+
+```{r}
+library(ggplot2)
+library(ggpubr)
+library(gridExtra)
+library(ggbeeswarm)
+
+
+for(i in 1:lv_num) {
+  # Create a data frame
+  data <- data.frame(independent = metadata$karyotype_binary, mediator = res$W[,i], dependent = metadata$Obesity)
+  
+  data <- data %>%
+    na.omit()
+  
+  # Plot
+
+  
+  p2 <- ggplot(data, aes(x = factor(dependent), y = mediator, color = factor(independent))) +
+    geom_boxplot( alpha = .5)+
+    geom_quasirandom()+
+    stat_compare_means(method = "wilcox.test", label = "p.format", 
+                       comparisons = list(c("0","1")))+
+    labs(title = "Stratified By Karyotype",
+         y = paste0("LV",i),
+         x = "Condition",
+         color = "T21")+
+     facet_wrap(~factor(independent)) +
+    theme_classic()
+  
+  
+  p1 <- ggplot(data, aes(x = factor(dependent), y = mediator)) +
+    geom_boxplot(alpha = .5)+
+    geom_jitter()+
+      stat_compare_means(method = "wilcox.test", label = "p.format")+
+    labs(tile = "Full Cohort",
+         y = paste0("LV",i),
+         x = "Condition",
+         color = "T21") +
+    theme_classic()
+  
+  
+  grid.arrange(p1,p2, ncol = 2, top = paste0("LV",i), widths = c(1,2))
+}
+
+```
+
+# Gene set enrichment
+
+```{r}
+
+library(fgsea)
+
+pathways <- gmtPathways("~/OneDrive - The University of Colorado Denver/Projects/causalNMF/data/gene_sets/c2.cp.kegg_legacy.v2024.1.Hs.symbols.gmt")
+
+H <- as.data.frame(t(res$H))
+
+signatures <- lapply(1:lv_num, function(i) {
+                  rnk <- as.numeric(H[,i])
+                  names(rnk) <- rownames(H) 
+                  fgsea(pathways = pathways,
+                  stats    = rnk,
+                  minSize  = 15,
+                  maxSize  = 500)
+})
+
+
+signatures_NES <- lapply(1:lv_num, function (x) {    
+    signatures[[x]] <- signatures[[x]] %>%
+        dplyr::select(pathway, NES) %>%
+        setNames(c("pathway", paste0("NES",x)))
+})
+
+
+signatures_df <- signatures_NES %>% 
+  reduce(full_join, by = "pathway") %>% 
+  mutate(pathway = gsub("HALLMARK_","", pathway)) %>%
+  mutate(pathway = gsub("_"," ", pathway)) %>%
+  column_to_rownames("pathway")
+
+
+signatures_df %>% arrange(-NES4) %>% head(n = 10)
+
+
+library(ComplexHeatmap)
+
+Heatmap(as.matrix(signatures_df[,1:3]))
+
+
+```
+
+
+```{r}
+LV <- as.data.frame(res$W)
+
+normalize <- function(x, ...) {
+    return((x - min(x, ...)) /(max(x, ...) - min(x, ...)))
+}
+
+LV <- apply(LV,2, normalize)
+  
+input = cbind(LV,
+              "Karyotype" = metadata$Karyotype=="T21",
+              "Sex" = metadata$Sex=="Male",
+              "Age" = normalize(metadata$Age_at_visit),
+              "Autoimmune Skin" = metadata$Any.autoimmune.skin.condition ==1,
+              "Hypothyroidism"=   metadata$Any.hypothyroidism==1,
+              "Sleep Apnea" =  metadata$Any.sleep.apnea==1,
+              "Hearing Loss"  =   metadata$Any.hearing.loss.condition==1)
+
+names(input) <- make.names(names(input))
+
+write.table(input, file.path("~/OneDrive - The University of Colorado Denver/Projects/causalNMF/results/input.tsv"), sep = "\t", quote = F)
+```
+
+
+```{r}
+library(reticulate)
+
+repl_python()
+
+```
+
+```{python}
+
+from causallearn.search.ConstraintBased.PC import pc
+from causallearn.utils.PCUtils.BackgroundKnowledge import BackgroundKnowledge
+import pandas as pd
+import numpy as np
+
+df = pd.read_csv("~/OneDrive - The University of Colorado Denver/Projects/causalNMF/results/input.tsv", sep="\t")
+bgk_sample = BackgroundKnowledge()
+column_names = df.columns
+
+for node_1 in ["Karyotype", "Age",  "Sex","Autoimmune Skin","Hypothyroidism", "Sleep Apnea","Hearing Loss"]:
+        for node_2 in column_names.tolist():
+            bgk_sample.add_forbidden_by_pattern(node_pattern1=node_1, node_pattern2=node_2)
+
+data = np.array(df.values, dtype = float)
+
+
+
+cg = pc(data, alpha=0.1, indep_test="fisherz", background_knowledge=bgk_sample, node_names=column_names.tolist())
+
+graph_output = cg.G.graph
+output = np.zeros_like(graph_output)
+
+n_x, n_y = graph_output.shape
+for i in range(n_x):
+    for j in range(n_y):
+        if (graph_output[i,j] == 1) and (graph_output[j,i] == -1):
+            output[i,j]=1
+        elif (graph_output[i,j] * graph_output[j,i] > 0):
+            output[i,j]=1
+            output[j,i]=1
+        elif (graph_output[i,j] + graph_output[j,i] != 0):
+            print("nonsymettric")
+
+ns = pd.DataFrame(output, columns = df.columns, index = df.columns)
+ns.to_csv("~/OneDrive - The University of Colorado Denver/Projects/causalNMF/results/pcOut.tsv", sep="\t")
+
+```
+
+
+```{r}
+library(igraph)
+
+pcout <- read.delim("~/OneDrive - The University of Colorado Denver/Projects/causalNMF/results/pcOut.tsv", sep="\t")
+
+pcout <- pcout %>% column_to_rownames("X")
+
+pcout <- apply(pcout, 2, as.factor)
+
+g <- graph_from_adjacency_matrix(pcout)
+
+tkplot(g)
+
+
+```
+
+
+
+```{r}
+
+tk_off()
+
+```

@@ -1,0 +1,229 @@
+---
+title: "GR-NMF"
+author: "Lucas Gillenwater"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, root.dir = "~/OneDrive - The University of Colorado Denver/Projects/causalNMF/")
+```
+
+
+
+# Data
+```{r}
+## counts pre=processing, only run once.
+
+# counts <- read.delim("~/OneDrive - The University of Colorado Denver/Projects/ImmunoMetabolicSubtypes/data/HTP_data/HTP_WholeBlood_RNAseq_Counts_Synapse.txt")
+# 
+# load("~/OneDrive - The University of Colorado Denver/Projects/ImmunoMetabolicSubtypes/data/processed/processed_transcriptome.RData")
+# 
+# htp_expr <- counts %>%
+#     filter(Gene_name %in% names(expression_list$expression)) %>%
+#     dplyr::select(LabID, Gene_name,Value) %>%
+#     distinct(LabID, Gene_name, .keep_all = T) %>%
+#     pivot_wider(names_from = Gene_name, id_cols = LabID, values_from = Value) %>%
+#     column_to_rownames("LabID")
+# 
+# save(htp_expr, file = "~/OneDrive - The University of Colorado Denver/Projects/causalNMF/data/htp_expression_counts_prot_variance_filtered.RData")
+
+```
+
+
+```{r}
+
+library(tidyverse)
+setwd("~/OneDrive - The University of Colorado Denver/Projects/causalNMF/")
+source("./R/functions.R")
+
+load( "~/OneDrive - The University of Colorado Denver/Projects/causalNMF/data/htp_expression_counts_prot_variance_filtered.RData")
+
+comorbid_long <- read.delim("~/OneDrive - The University of Colorado Denver/Projects/ImmunoMetabolicSubtypes/data/HTP_data/P4C_Comorbidity_020921.tsv", skip = 1)
+
+comorbid_wide <- comorbid_long %>%
+#  mutate(HasCondition = as.factor(HasCondition)) %>%
+  pivot_wider(names_from = Condition, values_from = HasCondition, id_cols = RecordID)
+
+metadata <- read.delim("~/OneDrive - The University of Colorado Denver/Projects/ImmunoMetabolicSubtypes/data/HTP_data/P4C_metadata_021921_Costello.txt")
+
+metadata <- metadata %>%
+  left_join(comorbid_wide, by = "RecordID")
+
+dim(metadata)
+
+metadata <- metadata %>%
+  mutate(karyotype_binary =ifelse(Karyotype == "T21",1,0))
+
+# metadata <- metadata %>%
+#   mutate(
+#     across(unique(comorbid_long$Condition), ~replace_na(.x,as.factor(0))))
+
+metadata <- metadata %>%
+  tibble(.name_repair = "universal")
+
+# create metavariable for features with counts > 
+
+#summary(metadata)
+
+# metadata <- metadata %>%
+#   mutate(condition = interaction(metadata$Any.autoimmune.skin.condition,
+#                                  metadata$Any.hypothyroidism))
+# 
+
+metadata <- metadata %>%
+  filter(LabID %in% rownames(htp_expr)) 
+
+htp_expr <- htp_expr %>%
+  filter(rownames(htp_expr) %in% metadata$LabID)
+
+
+metadata <- metadata[match(rownames(htp_expr),metadata$LabID),]
+
+identical(rownames(htp_expr), metadata$LabID)
+
+
+```
+
+
+```{r}
+# # prepare the graph data, only run once
+# library(tidyverse)
+# library(igraph)
+# 
+# # read in the data
+# blood <- read.csv("~/OneDrive - The University of Colorado Denver/Projects/Net21/networks/blood_top", sep = "\t", header = F)
+# gene_ids <- read.csv("~/OneDrive - The University of Colorado Denver/Projects/Net21/data/hgnc_complete_set.txt", sep = "\t")
+# 
+# # convert to igraph graph
+# names(blood) <- c("from", "to", "weight")
+# blood_graph <- graph_from_data_frame(blood, directed = TRUE)
+# 
+# # extract adjacency matrix
+# blood_adj <- as_adjacency_matrix(blood_graph, sparse = F, attr = "weight")
+# 
+# entrez_ids <- colnames(blood_adj)
+# # function to convert entrez_ids to HGNC symbols
+# entrezToHGNC <- function(gene_ids,entrez_ids) {
+#     hgnc_ids <- gene_ids %>%
+#       filter(entrez_id %in% entrez_ids) %>%
+#       arrange(match(entrez_id,entrez_ids)) %>%
+#       select(symbol,entrez_id)
+#     return(hgnc_ids)
+# }
+# 
+# # get entrez symbols
+# blood_cols <- entrezToHGNC(gene_ids, colnames(blood_adj))
+# blood_rows <- blood_cols
+# 
+# # filter by genes in htp_expr
+# blood_cols_filtered <- blood_cols %>%
+#   filter(symbol %in% names(htp_expr))
+# blood_rows_filtered <- blood_cols_filtered
+# 
+# # filter adjacency matrix
+# blood_adj_filtered <- blood_adj[colnames(blood_adj) %in% blood_cols_filtered$entrez_id, rownames(blood_adj) %in% blood_rows_filtered$entrez_id]
+# 
+# colnames(blood_adj_filtered) <- blood_cols_filtered$symbol
+# rownames(blood_adj_filtered) <- blood_rows_filtered$symbol
+# 
+# save(blood_adj_filtered, file = "../data/blood_humanbase_graph.RData")
+
+```
+
+
+```{r}
+setwd("~/OneDrive - The University of Colorado Denver/Projects/causalNMF/")
+# filter expression data and align graph with expression data
+load("./data/blood_humanbase_graph.RData")
+
+grn <- blood_adj_filtered
+
+htp_expr <- htp_expr[, names(htp_expr) %in% colnames(grn)]
+htp_expr <- htp_expr[, match(colnames(grn), names(htp_expr))]
+
+```
+
+
+## Calculate thesimilarity matrices
+```{r}
+library(SNFtool)
+library(pdist)
+
+# select the co-occurring conditions and binary karyotype
+binary_metadata <- metadata[, 9:26]
+
+# impute missing values with 0. This may not be true, but we wouldn't be using that missing data anyways to determine the distances between patients.
+binary_metadata[is.na(binary_metadata)] <- 0
+
+patient_distance <- dist2(as.matrix(binary_metadata), as.matrix(binary_metadata)) # euclidean distance
+patient_similarity <- exp(-patient_distance)
+
+
+```
+
+
+```{r}
+
+library(Rcpp)
+cppFunction('NumericMatrix euclideanDist(NumericMatrix X) {
+  int n = X.nrow(), m = X.ncol();
+  NumericMatrix out(n, n);
+  for (int i = 0; i < n; i++) {
+    for (int j = i; j < n; j++) {
+      double sum = 0;
+      for (int k = 0; k < m; k++) {
+        sum += pow(X(i, k) - X(j, k), 2);
+      }
+      out(i, j) = sum;
+      out(j, i) = out(i, j);
+    }
+  }
+  return out;
+}')
+
+system.time({distance_matrix <- euclideanDist(grn[1:3000,1:3000])})
+
+cor(distance_matrix[,1], grn_distance[,1])
+```
+
+# Running the model
+
+```{r}
+Y = apply(htp_expr,2, min_max_scale)
+input_grn =    grn[colnames(Y), colnames(Y)]
+
+system.time({grn_distance <- euclideanDist(input_grn)})
+
+## save distance and similarity matrices
+
+grn_similarity <- exp(-grn_distance)
+
+
+input_grn <- grn_similarity
+patient_similarity = patient_similarity
+
+```
+
+```{r}
+
+source("~/OneDrive - The University of Colorado Denver/Projects/causalNMF/R/functions.R")
+results <- GRNMF(Y = Y,
+          input_grn = input_grn,
+          patient_similarity = patient_similarity,
+          diff_threshold = 1e-4, 
+          l1 = .2,
+          l2 = .2,, 
+          beta = 1)
+          
+plot(results$error)
+plot(results$pat_sim_error_vec)
+plot(results$grn_error_vec)
+```
+
+```{r}
+
+
+
+
+```

@@ -1,0 +1,263 @@
+---
+title: "breast_GRNNMF"
+author: "Lucas Gillenwater"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## libraries
+```{r}
+source("../R/functions.R")
+
+library(tidyverse)
+```
+
+
+## read in the breast cancer data
+```{r}
+expression <- read.delim("../data/breast/exp", sep = " ")
+clinical <- read.delim("../data/breast/breast")
+survival <- read.delim("../data/breast/survival")
+```
+
+## proces the expression data
+```{r}
+filtered_expression <- expression %>%
+  filter(!(grepl("\\?",rownames(.)))) %>%
+  distinct( gsub("\\|.*", "", rownames(.)), .keep_all = T)
+
+gene_names <- gsub("\\|.*", "", rownames(filtered_expression))
+rownames(filtered_expression) <- gene_names
+
+# drop gene name column
+filtered_expression <- filtered_expression[, -ncol(filtered_expression)]
+
+exp_mad <- apply(filtered_expression,1,mean_absolute_deviation)
+exp_mad <- exp_mad[order(exp_mad,decreasing = T)] 
+
+top_genes <- exp_mad[1:1000]
+```
+
+```{r}
+filtered_expression <- filtered_expression[rownames(filtered_expression) %in% names(top_genes),]
+
+# log normalize 
+filtered_expression <- log(filtered_expression + .Machine$double.eps)
+
+```
+
+## process clinical data
+```{r}
+metadata <- clinical %>%
+  mutate(matchID = tolower(make.names(clinical$sampleID)))
+
+metadata$matchID <- sapply(metadata$matchID, function(x)substr(x,1, nchar(x) -3))
+
+metadata <- metadata %>%
+  inner_join(survival, by = c("matchID" ="PatientID" ), multiple = "first")
+
+metadata <- metadata %>%
+  select(sampleID,  days_to_birth, Survival, Death ) %>%
+  column_to_rownames("sampleID")
+
+rownames(metadata) <- make.names(rownames(metadata))
+
+metadata <- metadata %>%
+  filter(rownames(.) %in% names(filtered_expression))
+
+metadata <- metadata[match( names(filtered_expression), rownames(metadata)),]
+
+#metadata <- apply(metadata,2,min_max_scale)
+```
+
+## read in breast gene regulatory network
+# From TissueNexus: https://diseaselinks.com/TissueNexus/download.php. (accessed 10/8/24)
+
+```{r}
+library(igraph)
+
+network <- read.delim("../data/breast/breast_network.txt", header = F)
+
+# convert to igraph graph
+names(network) <- c("from", "to", "weight")
+graph <- graph_from_data_frame(network, directed = TRUE)
+
+# extract adjacency matrix
+adjacency <- as_adjacency_matrix(graph, sparse = F, attr = "weight")
+
+adj_feat_filtered <- colnames(adjacency)[colnames(adjacency) %in% rownames(filtered_expression)]
+
+adjacency_filtered <- adjacency[rownames(adjacency) %in% adj_feat_filtered, colnames(adjacency) %in% adj_feat_filtered]
+```
+
+```{r}
+filtered_expression <- filtered_expression[rownames(filtered_expression) %in% adj_feat_filtered,]
+
+filtered_expression <- filtered_expression[match( colnames(adjacency_filtered), rownames(filtered_expression)),]
+
+identical(colnames(adjacency_filtered), rownames(filtered_expression))
+
+
+identical(names(filtered_expression), rownames(metadata))
+
+filtered_expression = apply(filtered_expression,1,min_max_scale)
+
+```
+
+# calculate similarity matrices
+```{r}
+
+
+
+grn_distance <- euclideanDist(as.matrix(adjacency_filtered))
+grn_similarity <- exp(-grn_distance)
+rownames(grn_similarity) = rownames(adjacency_filtered)
+colnames(grn_similarity) = rownames(adjacency_filtered)
+
+grn_similarity <- min_max_scale(grn_similarity)
+
+save(grn_similarity, file = "breast_similarity.RData")
+
+```
+
+## Identify the parameters over all patients
+```{r}
+source("~/OneDrive - The University of Colorado Denver/Projects/causalNMF/R/functions.R")
+
+
+
+# Initialize W and H 
+set.seed(123)
+
+## separate out training and testing
+# Create a training index
+train_index <- sample(seq_len(nrow(metadata)), size = 0.7 * nrow(metadata))
+
+#filtered_expression <- as.data.frame(t(filtered_expression))
+# Split the data into training and testing sets
+train_data <- filtered_expression[train_index, ]
+test_data <- filtered_expression[-train_index, ]
+
+
+train_meta <- metadata[train_index,]
+
+
+
+patient_distance <- euclideanDist(as.matrix(train_meta))
+patient_distance[is.na(patient_distance)] <- 0
+patient_similarity <- exp(-patient_distance)
+rownames(patient_similarity) = rownames(train_meta)
+colnames(patient_similarity) = rownames(train_meta)
+
+patient_similarity <- min_max_scale(patient_similarity)
+  
+#svd_res <- svd(Y, center = TRUE, scale = F))
+  
+svd_res <- svd(scale(train_data, center = T, scale = F))
+k <- findK(svd_res) 
+
+source("~/OneDrive - The University of Colorado Denver/Projects/causalNMF/R/functions.R")
+results <- GRNMF(Y = train_data,
+          input_grn = grn_similarity,
+          patient_similarity = patient_similarity,
+          diff_threshold = 1e-4, 
+          lambda_1 = .1,
+          lambda_2 = .1,
+          k = k,
+          svd_res = svd_res, 
+          beta = 1,
+          learning_rate = .01)
+
+          
+total_error <- rowSums(cbind(results$error,results$pat_sim_error_vec, results$grn_error_vec))
+plot(total_error[2:length(total_error)])
+```
+
+## Testing
+```{r}
+
+# project data in W from learned mode
+source("~/OneDrive - The University of Colorado Denver/Projects/causalNMF/R/functions.R")
+W_test <- project_W(test_data,results$H,k)
+
+
+```
+
+## Survival Analysis
+```{r}
+
+install.packages("survival")
+install.packages("survminer")
+library(survival)
+library(survminer)
+
+install.packages("penalized")
+library(penalized)
+
+
+test_meta <- metadata[-train_index,]
+# Example: time is the follow-up time, status is the event indicator
+test_meta <- as.data.frame(test_meta)
+test_meta[test_meta <=0] = 1
+
+colnames(W_test) <- paste0("LV",1:ncol(W_test))
+covariates <- paste(colnames(W_test), collapse = "+")
+
+eval(parse(text = sprintf("x <- model.matrix(~%s, data = as.data.frame(W_test))", covariates)))
+x <- x[,-1]
+
+y <- Surv(test_meta$Survival,test_meta$Death)
+
+cv_fit <- cv.glmnet(x, y, family = "cox", alpha = 0.5)  # alpha = 0.5 for elastic net
+
+
+best_lambda <- cv_fit$lambda.min
+print(best_lambda)
+
+# Get the cross-validated error for the best lambda
+cv_error <- cv_fit$cvm[cv_fit$lambda == best_lambda]
+print(cv_error)
+
+nonzero <- as.matrix(coef(cv_fit, s = best_lambda))
+nonzero = nonzero[nonzero != 0,  drop = FALSE]
+
+```
+
+# NMF
+```{r}
+library(NMF)
+
+nmf_result <- nmf(train_data, rank = k, seed = 'nndsvd')
+nmf_W_test <- project_W(test_data,coef(nmf_result),k)
+colnames(nmf_W_test) <-  paste0("LV", 1:k)
+
+eval(parse(text = sprintf("x_nmf <- model.matrix(~%s, data = as.data.frame(nmf_W_test))", covariates)))
+x_nmf <- x_nmf[,-1]
+
+y <- Surv(test_meta$Survival,test_meta$Death)
+
+cv_fit_nmf <- cv.glmnet(x_nmf, y, family = "cox", alpha = 0.5)  # alpha = 0.5 for elastic net
+
+
+best_lambda_nmf <- cv_fit_nmf$lambda.min
+
+# Get the cross-validated error for the best lambda
+cv_error_nmf <- cv_fit_nmf$cvm[cv_fit_nmf$lambda == best_lambda_nmf]
+print(cv_error_nmf)
+
+nonzero <- as.matrix(coef(cv_fit_nmf, s = best_lambda_nmf))
+nonzero = nonzero[nonzero != 0,  drop = FALSE]
+```
+
+
+## Enrichment of H matrix
+```{r}
+
+
+
+
+```
